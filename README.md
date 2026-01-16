@@ -47,8 +47,8 @@ where date(p.payment_date) = '2005-07-30' and p.payment_date = r.rental_date and
 ```sql
 explain analyze
 select distinct 
-	concat(c.last_name, ' ', c.first_name),
-	sum(p.amount) over (partition by c.customer_id, f.title)
+	concat(c.last_name, ' ', c.first_name) as full_name,
+	sum(p.amount) as total_amount_per_customer_per_film
 from payment p, rental r, customer c, inventory i, film f
 where date(p.payment_date) = '2005-07-30'
 	and p.payment_date = r.rental_date
@@ -57,23 +57,22 @@ where date(p.payment_date) = '2005-07-30'
 ```
 Получаем:
 ```sql
-EXPLAIN                                                                                                                                                                                                                                                        |
----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
--> Table scan on <temporary>  (cost=2.5..2.5 rows=0) (actual time=4306..4306 rows=391 loops=1)¶    -> Temporary table with deduplication  (cost=0..0 rows=0) (actual time=4306..4306 rows=391 loops=1)¶        -> Window aggregate with buffering: sum(p.amount|
-```
-
-Эммм... сделаем красиво:
-
-```sql
--> Table scan on <temporary>
-   (cost=2.5..2.5 rows=0)
-   (actual time=4306..4306 rows=391 ...)
-
-    -> Temporary table with deduplication
-       (cost=0..0 rows=0)
-       (actual time=4306..4306 rows=391 ...)
-
-        -> Window aggregate with buffering: sum(p.amount)
+-> Table scan on <temporary>  (cost=2.5..2.5 rows=0) (actual time=4235..4235 rows=391 loops=1)
+    -> Temporary table with deduplication  (cost=0..0 rows=0) (actual time=4235..4235 rows=391 loops=1)
+        -> Window aggregate with buffering: sum(p.amount) OVER (PARTITION BY c.customer_id,f.title )   (actual time=2474..4083 rows=642000 loops=1)
+            -> Sort: c.customer_id, f.title  (actual time=2474..2533 rows=642000 loops=1)
+                -> Stream results  (cost=22.7e+6 rows=16.7e+6) (actual time=0.634..1894 rows=642000 loops=1)
+                    -> Nested loop inner join  (cost=22.7e+6 rows=16.7e+6) (actual time=0.63..1647 rows=642000 loops=1)
+                        -> Nested loop inner join  (cost=21e+6 rows=16.7e+6) (actual time=0.624..1480 rows=642000 loops=1)
+                            -> Nested loop inner join  (cost=19.3e+6 rows=16.7e+6) (actual time=0.617..1302 rows=642000 loops=1)
+                                -> Inner hash join (no condition)  (cost=1.65e+6 rows=16.5e+6) (actual time=0.605..42.2 rows=634000 loops=1)
+                                    -> Filter: (cast(p.payment_date as date) = '2005-07-30')  (cost=1.72 rows=16500) (actual time=0.286..5.56 rows=634 loops=1)
+                                        -> Table scan on p  (cost=1.72 rows=16500) (actual time=0.276..4.11 rows=16044 loops=1)
+                                    -> Hash
+                                        -> Covering index scan on f using idx_title  (cost=103 rows=1000) (actual time=0.0336..0.24 rows=1000 loops=1)
+                                -> Covering index lookup on r using rental_date (rental_date = p.payment_date)  (cost=0.969 rows=1.01) (actual time=0.00141..0.00188 rows=1.01 loops=634000)
+                            -> Single-row index lookup on c using PRIMARY (customer_id = r.customer_id)  (cost=250e-6 rows=1) (actual time=156e-6..172e-6 rows=1 loops=642000)
+                        -> Single-row covering index lookup on i using PRIMARY (inventory_id = r.inventory_id)  (cost=250e-6 rows=1) (actual time=138e-6..154e-6 rows=1 loops=642000)
 ```
 
 Что этот запрос выполняет:
@@ -105,44 +104,37 @@ MySQL создал временную таблицу (`Table scan on <temporary>
 Оптимизированный запрос может выглядеть как-то так:
 
 ```sql
-SELECT
-    CONCAT(c.last_name, ' ', c.first_name),
-    f.title,
-    SUM(p.amount)
-FROM payment p
-JOIN rental r ON p.rental_id = r.rental_id
-JOIN customer c ON r.customer_id = c.customer_id
-JOIN inventory i ON r.inventory_id = i.inventory_id
-JOIN film f ON i.film_id = f.film_id
-WHERE p.payment_date >= '2005-07-30'
-  AND p.payment_date <  '2005-07-31'
-GROUP BY c.customer_id, f.film_id;
+select
+	concat(c.last_name, ' ', c.first_name) as full_name,
+	sum(p.amount) as total_amount_per_customer_per_film
+from payment p 
+join
+	rental r on p.payment_date = r.rental_date 
+join
+	customer c on r.customer_id = c.customer_id 
+join
+	inventory i on r.inventory_id = i.inventory_id 
+join
+	film f on i.film_id = f.film_id 
+where
+	p.payment_date >= '2005-07-30' and p.payment_date < '2005-07-31'
+group by 	c.customer_id, c.last_name, c.first_name;
 ```
 
 Что же покажет `explain analyze`?
 
 ```sql
--> Table scan on <temporary>
-   (actual time=21.7..21.9 rows=634...)
-   -> Aggregate using temporary table
-      (actual time=21.7..21.7 rows=634...)
-      -> Nested loop inner join  (cost=5527 rows=1833)
-         (actual time=0.456..19.9 rows=634...)
+-> Table scan on <temporary>  (actual time=11.1..11.1 rows=391 loops=1)
+    -> Aggregate using temporary table  (actual time=11.1..11.1 rows=391 loops=1)
+        -> Nested loop inner join  (cost=5584 rows=1855) (actual time=0.338..10.1 rows=642 loops=1)
+            -> Nested loop inner join  (cost=4934 rows=1855) (actual time=0.331..8.86 rows=642 loops=1)
+                -> Nested loop inner join  (cost=4285 rows=1855) (actual time=0.325..7.64 rows=642 loops=1)
+                    -> Nested loop inner join  (cost=3636 rows=1855) (actual time=0.317..6.83 rows=642 loops=1)
+                        -> Filter: ((p.payment_date >= TIMESTAMP'2005-07-30 00:00:00') and (p.payment_date < TIMESTAMP'2005-07-31 00:00:00'))  (cost=1674 rows=1833) (actual time=0.306..5.25 rows=634 loops=1)
+                            -> Table scan on p  (cost=1674 rows=16500) (actual time=0.296..4.2 rows=16044 loops=1)
+                        -> Covering index lookup on r using rental_date (rental_date = p.payment_date)  (cost=0.969 rows=1.01) (actual time=0.00172..0.00235 rows=1.01 loops=634)
+                    -> Single-row index lookup on c using PRIMARY (customer_id = r.customer_id)  (cost=0.25 rows=1) (actual time=0.00114..0.00116 rows=1 loops=642)
+                -> Single-row index lookup on i using PRIMARY (inventory_id = r.inventory_id)  (cost=0.25 rows=1) (actual time=0.00177..0.00179 rows=1 loops=642)
+            -> Single-row covering index lookup on f using PRIMARY (film_id = i.film_id)  (cost=0.25 rows=1) (actual time=0.00176..0.00178 rows=1 loops=642)
 ```
-
-Чтож, вполне приемлемо.
-
-Строка `-> Nested loop inner join` указывает на то, что база данных использует алгоритм вложенных циклов. Это значит, что MySQL берет строку из одной таблицы (ведущей) и ищет соответствующие строки в другой таблице. Этот алгоритм эффективен только тогда, когда поля, по которым идет соединение `(on ...)`, проиндексированы. Если бы индексов на внешних ключах (rental_id, inventory_id, film_id, customer_id) не было, база данных, скорее всего, выбрала бы Hash Join или работала бы значительно медленнее.
-
-Индекс для фильтрации `WHERE` возможно используется. Общее время выполнения (около 21 мс) и количество строк (634) для такого количества джойнов подсказывают, что индекс по полю payment_date в таблице `payment` скорее всего используется. Если бы индекса не было, базе пришлось бы делать Full Table Scan всей таблицы `payment`, что заняло бы больше времени, что было видно до оптимизации.
-
-Индекс для группировки `GROUP BY` не используется.
-
-```sql
--> Table scan on <temporary>
-   -> Aggregate using temporary table
-```
-
-Запрос группирует данные по полям из двух разных таблиц `customer` и `film`, которые находятся на разных концах цепочки джойнов. Существование одного индекса, который покрыл бы эту группировку, было бы весьма затруднительным. Поэтому здесь используется временная таблица.
-
 ---
